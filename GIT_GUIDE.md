@@ -49,6 +49,9 @@ SAM2_BUILD_CUDA=0 uv pip install -e . --no-build-isolation \
     -i https://pypi.tuna.tsinghua.edu.cn/simple
 cd ..
 
+# 修复 SAM2Long 在 MOSE 多目标/多候选输出上的 .item() 崩溃
+python patch_sam2long.py SAM2Long
+
 # ===== 下载模型权重 =====
 mkdir -p SAM2Long/checkpoints
 # B+ 模型
@@ -76,8 +79,12 @@ cd MOSE2
 
 # 把脚本复制到 SAM2Long 目录下运行（因为需要读取 sam2 的 configs/）
 cp run_inference.py SAM2Long/
+cp patch_sam2long.py SAM2Long/
 cp -r mosev2_作业 SAM2Long/
 cd SAM2Long
+
+# 如果服务器上直接在 SAM2Long 目录运行，也可以在这里再执行一次（幂等）
+python patch_sam2long.py .
 
 # SAM2Long + L+（推荐）
 python run_inference.py --strategy sam2long --model large

@@ -79,9 +79,9 @@ from tqdm import tqdm
 
 # ===================== 默认路径 =====================
 DEFAULTS = {
-    "jpeg_dir": "mosev2_作业/homework/JPEGImages",
-    "anno_dir": "mosev2_作业/homework/Annotations",
-    "existing_output_dir": "mosev2_作业/homework/output",
+    "jpeg_dir": "homework/JPEGImages",
+    "anno_dir": "homework/Annotations",
+    "existing_output_dir": "homework/output",
     "output_dir": "output_15videos",
     "submission_dir": "submission",
     "submission_zip": "submission.zip",
@@ -159,6 +159,105 @@ def build_predictor(args):
     return predictor, cfg["name"], device
 
 
+def iter_propagation_outputs(predictor, state):
+    """兼容原版 SAM2 的逐帧 yield 和 SAM2Long 的一次性 return。"""
+    outputs = predictor.propagate_in_video(state)
+
+    # SAM2Long returns: (obj_ids, [mask_logits_per_frame, ...])
+    if isinstance(outputs, tuple) and len(outputs) == 2:
+        out_obj_ids, out_mask_logits_by_frame = outputs
+        for frame_idx, out_mask_logits in enumerate(out_mask_logits_by_frame):
+            yield frame_idx, out_obj_ids, out_mask_logits
+        return
+
+    # Official SAM2 yields: (frame_idx, obj_ids, mask_logits)
+    yield from outputs
+
+
+def _infer_sam2(predictor, state, obj_ids, first_mask, frame_names, out_dir,
+                palette, height, width):
+    """SAM2 基线推理：所有目标联合推理。"""
+    # 添加所有目标的首帧 mask
+    for obj_id in obj_ids:
+        predictor.add_new_mask(
+            inference_state=state, frame_idx=0,
+            obj_id=obj_id, mask=(first_mask == obj_id),
+        )
+
+    # 逐帧传播
+    for frame_idx, out_obj_ids, out_mask_logits in iter_propagation_outputs(predictor, state):
+        per_obj = {
+            int(oid): (out_mask_logits[i][0] > 0.0).cpu().numpy()
+            for i, oid in enumerate(out_obj_ids)
+        }
+        combined = combine_per_obj_masks(per_obj, height, width)
+        save_mask(
+            os.path.join(out_dir, f"{frame_names[frame_idx]}.png"),
+            combined, palette,
+        )
+
+    predictor.reset_state(state)
+
+
+def _infer_sam2long(predictor, state, obj_ids, first_mask, frame_names, out_dir,
+                    palette, height, width, args):
+    """SAM2Long 推理：逐目标独立推理，最后合并去重叠。
+
+    SAM2Long 的 memory tree 机制要求单目标推理，多目标联合会导致
+    iou tensor 维度不匹配。官方做法是 per-object separate inference。
+    """
+    from collections import defaultdict
+
+    # 设置 SAM2Long 参数
+    state['num_pathway'] = args.num_pathway
+    state['iou_thre'] = args.iou_thre
+    state['uncertainty'] = args.uncertainty
+
+    num_frames = state["num_frames"]
+
+    # 逐目标独立推理，收集每个目标在每帧的 score
+    scores_per_obj = defaultdict(dict)  # {obj_id: {frame_idx: score_tensor}}
+
+    for obj_id in obj_ids:
+        print(f"    目标 {obj_id} 推理中...")
+        predictor.reset_state(state)
+
+        predictor.add_new_mask(
+            inference_state=state, frame_idx=0,
+            obj_id=obj_id, mask=(first_mask == obj_id),
+        )
+
+        for frame_idx, out_obj_ids, out_mask_logits in iter_propagation_outputs(predictor, state):
+            # out_mask_logits shape: (1, 1, H, W) — 只有一个目标
+            scores_per_obj[obj_id][frame_idx] = out_mask_logits[0].cpu()
+
+    predictor.reset_state(state)
+
+    # 合并：对每帧，先做 non-overlapping 约束，再生成最终 mask
+    for frame_idx in range(num_frames):
+        # 构建 (num_objects, 1, H, W) 的 score tensor
+        all_scores = torch.full(
+            (len(obj_ids), 1, height, width), -1024.0, dtype=torch.float32,
+        )
+        for i, obj_id in enumerate(obj_ids):
+            if frame_idx in scores_per_obj[obj_id]:
+                all_scores[i] = scores_per_obj[obj_id][frame_idx]
+
+        # 非重叠约束（像素只归属 score 最高的目标）
+        if len(obj_ids) > 1 and hasattr(predictor, '_apply_non_overlapping_constraints'):
+            all_scores = predictor._apply_non_overlapping_constraints(all_scores)
+
+        per_obj = {
+            obj_id: (all_scores[i][0] > 0.0).numpy()
+            for i, obj_id in enumerate(obj_ids)
+        }
+        combined = combine_per_obj_masks(per_obj, height, width)
+        save_mask(
+            os.path.join(out_dir, f"{frame_names[frame_idx]}.png"),
+            combined, palette,
+        )
+
+
 def infer_single_video(predictor, video_dir, anno_dir, out_dir, args, device):
     """对单个视频执行推理，保存结果到 out_dir。"""
     os.makedirs(out_dir, exist_ok=True)
@@ -184,39 +283,15 @@ def infer_single_video(predictor, video_dir, anno_dir, out_dir, args, device):
             video_path=video_dir,
             async_loading_frames=False,
         )
-
-        # SAM2Long: 设置 memory tree 参数
-        if args.strategy == "sam2long":
-            state['num_pathway'] = args.num_pathway
-            state['iou_thre'] = args.iou_thre
-            state['uncertainty'] = args.uncertainty
-
-        # 添加首帧 mask prompt
-        for obj_id in obj_ids:
-            predictor.add_new_mask(
-                inference_state=state,
-                frame_idx=0,
-                obj_id=obj_id,
-                mask=(first_mask == obj_id),
-            )
-
-        # 传播
         height = state["video_height"]
         width = state["video_width"]
 
-        for frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(state):
-            per_obj = {
-                int(oid): (out_mask_logits[i][0] > 0.0).cpu().numpy()
-                for i, oid in enumerate(out_obj_ids)
-            }
-            combined = combine_per_obj_masks(per_obj, height, width)
-            save_mask(
-                os.path.join(out_dir, f"{frame_names[frame_idx]}.png"),
-                combined,
-                palette,
-            )
-
-        predictor.reset_state(state)
+        if args.strategy == "sam2long":
+            _infer_sam2long(predictor, state, obj_ids, first_mask, frame_names,
+                           out_dir, palette, height, width, args)
+        else:
+            _infer_sam2(predictor, state, obj_ids, first_mask, frame_names,
+                       out_dir, palette, height, width)
 
     output_count = len(os.listdir(out_dir))
     if output_count != len(frame_names):
