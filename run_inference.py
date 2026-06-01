@@ -60,6 +60,9 @@ python -c "from sam2.build_sam import build_sam2_video_predictor; print('OK')"
     # 仅合并打包（推理已完成）
     python run_inference.py --pack_only
 
+    # 断点续跑：跳过 output_dir 中已经完整输出的视频
+    python run_inference.py --strategy sam2long --model large --resume
+
     # 自定义路径
     python run_inference.py --strategy sam2long \
         --jpeg_dir /path/to/JPEGImages \
@@ -299,6 +302,22 @@ def infer_single_video(predictor, video_dir, anno_dir, out_dir, args, device):
     return output_count
 
 
+def is_video_complete(video_dir, out_dir):
+    """输出 PNG 数量与输入帧数一致时，认为该视频已完成。"""
+    if not os.path.isdir(out_dir):
+        return False, 0, 0
+
+    input_count = len([
+        f for f in os.listdir(video_dir)
+        if f.lower().endswith(('.jpg', '.jpeg', '.png'))
+    ])
+    output_count = len([
+        f for f in os.listdir(out_dir)
+        if f.lower().endswith('.png')
+    ])
+    return output_count == input_count and input_count > 0, output_count, input_count
+
+
 def run_inference(args):
     """对所有待推理视频执行推理。"""
     predictor, model_name, device = build_predictor(args)
@@ -318,11 +337,20 @@ def run_inference(args):
 
     for i, vname in enumerate(video_names):
         print(f"[{i+1}/{len(video_names)}] {vname}")
+        video_dir = os.path.join(args.jpeg_dir, vname)
+        out_dir = os.path.join(args.output_dir, vname)
+
+        if args.resume:
+            complete, output_count, input_count = is_video_complete(video_dir, out_dir)
+            if complete:
+                print(f"  ↪ 已完成，跳过 ({output_count}/{input_count} 帧)\n")
+                continue
+
         count = infer_single_video(
             predictor,
-            video_dir=os.path.join(args.jpeg_dir, vname),
+            video_dir=video_dir,
             anno_dir=os.path.join(args.anno_dir, vname),
-            out_dir=os.path.join(args.output_dir, vname),
+            out_dir=out_dir,
             args=args,
             device=device,
         )
@@ -454,6 +482,7 @@ def parse_args():
     g2.add_argument("--submission_zip", default=DEFAULTS["submission_zip"])
 
     # 流程控制
+    p.add_argument("--resume", action="store_true", help="断点续跑，跳过已完整输出的视频")
     p.add_argument("--pack_only", action="store_true", help="跳过推理，仅合并打包")
     p.add_argument("--no_pack", action="store_true", help="只推理不打包")
 
