@@ -1,0 +1,55 @@
+# ===================== 模型权重 =====================
+*.pth
+*.pt
+*.bin
+*.onnx
+*.safetensors
+checkpoints/
+
+# ===================== 数据 & 输出 =====================
+data/
+mosev2_作业/
+output_*/
+submission/
+submission.zip
+
+# ===================== 大文件 =====================
+*.mp4
+*.avi
+*.mov
+
+# ===================== Vendored 依赖 =====================
+sam2/
+SAM2Long/
+
+# ===================== Python =====================
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.so
+
+# ===================== 虚拟环境 =====================
+venv/
+.venv/
+mosev2_env/
+.conda/
+
+# ===================== Jupyter =====================
+.ipynb_checkpoints/
+*_student.ipynb
+
+# ===================== IDE =====================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===================== OS =====================
+.DS_Store
+Thumbs.db
+desktop.ini
